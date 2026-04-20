@@ -1,0 +1,471 @@
+from __future__ import annotations
+
+import argparse
+import sys
+import re
+import json
+
+from agents.crew_setup import (
+    run_planner,
+    run_worker,
+    run_critic,
+    run_intent_checker,
+    run_intent_critic,
+    run_quality_critic,
+    run_reverse_critic,
+    run_improver,
+)
+from config import settings
+from memory.chroma_store import MemoryStore
+from utils.helpers import print_section
+from evaluation.code_scorer import score_code
+from evaluation.merge_reviews import merge_reviews
+from evaluation.reverse_metrics import score_reverse_output
+from typing import Any, Dict
+
+from evaluation.scorer import (
+    extract_json_block,
+    normalize_review,
+    parse_review,
+    safe_parse_review,   # ← これを追加
+    safe_parse_improver,
+)
+
+
+
+def should_retry(
+    score: int,
+    threshold: int = 80,
+    is_reverse: bool = False,
+    tags: list[str] | None = None,
+) -> bool:
+    tags = tags or []
+
+    # -------------------------
+    # 🔥 Reverse Task
+    # -------------------------
+    if is_reverse:
+        # 構造系エラーは即リトライ
+        if "missing_analysis" in tags:
+            return True
+
+        if "missing_bug_taxonomy" in tags:
+            return True
+
+        if "missing_code" in tags:
+            return True
+
+        if "reverse_structure_fail" in tags:
+            return True
+
+        # 逆タスクなのに良すぎる → リトライ
+        if "too_correct" in tags:
+            return True
+
+        # スコア基準
+        return score < 90
+
+    # -------------------------
+    # 🧠 Normal Task
+    # -------------------------
+    return score < threshold
+
+
+
+
+
+def build_improved_task(original_task: str, review: dict) -> str:
+    weaknesses = "\n".join(f"- {w}" for w in review.get("weaknesses", []))
+    strengths = "\n".join(f"- {s}" for s in review.get("strengths", []))
+    next_action = review.get("next_action", "")
+
+    return f"""
+{original_task}
+
+【前回の評価】
+良かった点:
+{strengths if strengths else "- 特になし"}
+
+弱かった点:
+{weaknesses if weaknesses else "- 特になし"}
+
+次にやるべきこと:
+{next_action}
+
+【改善ルール】
+- 元のタスクの意図を絶対に変えないこと
+- 特に逆タスク（わざとバグを入れる等）の場合、その意図を必ず維持すること
+- 前回の弱点を改善すること
+- 良かった点は維持すること
+- 指示からズレないこと
+
+この条件を守って、次の出力を作成してください。
+"""
+
+
+def build_improved_task_from_improver(original_task: str, improver_result: dict) -> str:
+    priority_fixes = "\n".join(f"- {x}" for x in improver_result.get("priority_fixes", []))
+    keep = "\n".join(f"- {x}" for x in improver_result.get("keep", []))
+    improved_prompt = improver_result.get("improved_prompt", "")
+
+    return f"""
+{original_task}
+
+【改善優先項目】
+{priority_fixes if priority_fixes else "- 特になし"}
+
+【維持すべき点】
+{keep if keep else "- 特になし"}
+
+【改善指示】
+{improved_prompt if improved_prompt else "前回の弱点を改善しつつ、良かった点を維持してください。"}
+
+【重要ルール】
+- 元のタスクの意図を絶対に変えないこと
+- 特に逆タスクの場合、その意図を必ず維持すること
+- 良かった点は壊さずに維持すること
+- 弱点だけを優先的に改善すること
+"""
+
+
+
+def calibrate_review(review: dict, intent: dict) -> dict:
+    score = int(review.get("score", 0))
+    weaknesses = review.get("weaknesses", [])
+    tags = review.get("tags", [])
+    next_action = str(review.get("next_action", "")).strip()
+
+    if not isinstance(weaknesses, list):
+        weaknesses = [str(weaknesses)]
+
+    if not isinstance(tags, list):
+        tags = [str(tags)]
+
+    is_reverse = bool(intent.get("is_reverse_task", False))
+
+    if is_reverse:
+        if len(weaknesses) >= 1 and score > 95:
+            score = 95
+        if len(weaknesses) >= 2 and score > 93:
+            score = 93
+        if len(weaknesses) >= 3 and score > 91:
+            score = 91
+        if "instruction_violation" in tags:
+            score = min(score, 70)
+        if "reverse_task_failure" in tags:
+            score = min(score, 75)
+        if "改善" in next_action or "指示" in next_action:
+            score = min(score, 90)
+
+    review["score"] = max(0, min(100, score))
+    review["weaknesses"] = weaknesses
+    review["tags"] = tags
+    return review
+
+def clean_review(review: dict) -> dict:
+    return {
+        "score": int(review.get("score", 50)),
+        "strengths": review.get("strengths", [])[:5],
+        "weaknesses": review.get("weaknesses", [])[:5],
+        "tags": review.get("tags", [])[:5],
+        "next_action": str(review.get("next_action", ""))[:500],
+    }
+
+
+def run_pipeline(task: str) -> str:
+    store = MemoryStore()
+
+    # -------------------------
+    # 1. Intent
+    # -------------------------
+    intent_raw = run_intent_checker(task_text=task)
+    intent = extract_json_block(intent_raw)
+
+    if "わざと" in task or "バグ" in task:
+        intent["is_reverse_task"] = True
+
+
+    # ---- base_task を作る ----
+    if intent.get("is_reverse_task"):
+        base_task = f"""
+これは通常と逆の要求です。
+
+元のタスク:
+{task}
+
+目的:
+{intent.get("intent")}
+
+成功条件:
+{intent.get("success_criteria")}
+
+絶対ルール:
+- 高品質な正解を書かない
+- 意図的に欠陥やバグを含める
+- わざと不完全にする
+- ユーザーの「逆要求」を最優先で守る
+
+必ずこの意図を守って出力してください。
+"""
+    else:
+        base_task = task
+
+    current_task = base_task
+
+    print("=== INTENT ===")
+    print(intent)
+    print("=== CURRENT TASK ===")
+    print(current_task)
+
+    # -------------------------
+    # 2. Improvement Loop
+    # -------------------------
+    for attempt in range(1, settings.max_improvement_loops + 2):
+
+        print("============================================================")
+        print(f"試行 {attempt}")
+        print("============================================================")
+
+        # ---- Memory ----
+        try:
+            memory_text = store.format_memories_for_prompt(current_task) or ""
+        except Exception as e:
+            print("=== MEMORY ERROR ===")
+            print(repr(e))
+            memory_text = ""
+
+        # 実際に今回の試行で使うタスク
+        executed_task_text = f"""
+{current_task}
+
+=== 過去の知見 ===
+{memory_text}
+""".strip()
+
+        # ---- Planner ----
+        plan = run_planner(
+            task_text=executed_task_text,
+            memory_text=memory_text,
+        )
+        print("============================================================")
+        print(f"試行 {attempt} / PLAN")
+        print("============================================================")
+        print(plan)
+
+        # ---- Worker ----
+        output = run_worker(
+            task_text=executed_task_text,
+            memory_text=memory_text,
+            plan_text=plan,
+        )
+        print("============================================================")
+        print(f"試行 {attempt} / OUTPUT")
+        print("============================================================")
+        print(output)
+
+        # ---- Rule-based code score ----
+        code_score = score_code(output)
+
+        # reverse task のときだけ補正したいならここで調整してもよい
+        # if intent.get("is_reverse_task", False):
+        #     code_score = adjust_code_score_for_reverse(code_score, output)
+
+        print("=== RULE CODE SCORE ===")
+        print(code_score)
+
+        # -------------------------
+        # 3. Critics
+        # -------------------------
+        raw_intent_review = run_intent_critic(
+            task_text=executed_task_text,
+            output_text=output,
+        )
+        print("=== RAW INTENT REVIEW ===")
+        print(raw_intent_review)
+        intent_review = clean_review(safe_parse_review(raw_intent_review))
+
+        raw_quality_review = run_quality_critic(
+            task_text=executed_task_text,
+            output_text=output,
+        )
+        print("=== RAW QUALITY REVIEW ===")
+        print(raw_quality_review)
+        quality_review = clean_review(safe_parse_review(raw_quality_review))
+
+        reverse_review = None
+        if intent.get("is_reverse_task", False):
+            raw_reverse_review = run_reverse_critic(
+                task_text=executed_task_text,
+                output_text=output,
+            )
+            print("=== RAW REVERSE REVIEW ===")
+            print(raw_reverse_review)
+            reverse_review = clean_review(safe_parse_review(raw_reverse_review))
+
+        # ---- Reverse rule review ----
+        reverse_rule_score = 0
+        if intent.get("is_reverse_task", False):
+            reverse_rule_review = score_reverse_output(output)
+            reverse_rule_score = int(reverse_rule_review.get("score", 0))
+            print("=== REVERSE RULE REVIEW ===")
+            print(reverse_rule_review)
+        else:
+            reverse_rule_review = None
+
+        # -------------------------
+        # 4. Merge Reviews
+        # -------------------------
+        try:
+            review = merge_reviews(
+                intent_review=intent_review,
+                quality_review=quality_review,
+                reverse_review=reverse_review,
+                intent=intent,
+                code_score=code_score,
+                reverse_rule_score=reverse_rule_score,
+            )
+            review = clean_review(review)
+        except Exception as e:
+            print("=== MERGE REVIEW ERROR ===")
+            print(repr(e))
+            review = {
+                "score": 50,
+                "strengths": ["レビュー統合に失敗しました"],
+                "weaknesses": ["merge_reviewsで例外が発生しました"],
+                "tags": ["merge_review_error"],
+                "next_action": "review統合処理を点検してください",
+            }
+
+        print("============================================================")
+        print(f"試行 {attempt} / REVIEW")
+        print("============================================================")
+        print(review)
+
+        # -------------------------
+        # 5. Retry Judge
+        # -------------------------
+        if should_retry(
+            score=review["score"],
+            is_reverse=intent.get("is_reverse_task", False),
+            tags=review.get("tags", []),
+        ):
+            print("🔁 Retry triggered")
+
+            # 改善ループの上限に達していたら終了
+            if attempt >= settings.max_improvement_loops + 1:
+                print("⚠️ Max attempts reached. Returning current output.")
+
+                try:
+                    store.add_memory(
+                        task=executed_task_text,
+                        plan=plan,
+                        output=output,
+                        review=review,
+                        improvement_note=review.get("next_action", ""),
+                    )
+                except Exception as e:
+                    print("=== MEMORY SAVE ERROR ===")
+                    print(repr(e))
+
+                return output
+
+            # -------------------------
+            # 6. Improver
+            # -------------------------
+            try:
+                if intent.get("is_reverse_task", False):
+                    improver_review_text = f"""
+これは逆タスクです。
+目的は『より正しいコード』ではなく、『より教育的で構造化された失敗例』です。
+
+現在のレビュー:
+{review}
+
+改善方向:
+- バグを減らさない
+- 良い設計にしない
+- バグの種類を明示する
+- Cognitive Trap を書く
+- 修正手順と再発防止策を追加する
+"""
+                else:
+                    improver_review_text = str(review)
+
+                raw_improver = run_improver(
+                    task_text=current_task,
+                    review_text=improver_review_text,
+                )
+
+                print("=== RAW IMPROVER ===")
+                print(raw_improver)
+
+                improver_result = safe_parse_improver(raw_improver)
+
+                if improver_result.get("error"):
+                    print("⚠️ Improver failed → fallback")
+                    current_task = build_improved_task(current_task, review)
+                else:
+                    current_task = build_improved_task_from_improver(
+                        current_task,
+                        improver_result,
+                    )
+
+            except Exception as e:
+                print("=== IMPROVER ERROR ===")
+                print(repr(e))
+                current_task = build_improved_task(current_task, review)
+
+            continue
+
+        else:
+            print("✅ Completed")
+
+            # -------------------------
+            # 7. Save Memory
+            # -------------------------
+            try:
+                store.add_memory(
+                    task=executed_task_text,
+                    plan=plan,
+                    output=output,
+                    review=review,
+                    improvement_note=review.get("next_action", ""),
+                )
+            except Exception as e:
+                print("=== MEMORY SAVE ERROR ===")
+                print(repr(e))
+
+            return output
+
+    # 念のためのフォールバック
+    return output
+
+
+
+
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Local AI Project with CrewAI + ChromaDB + Evaluation"
+    )
+    parser.add_argument(
+        "--task",
+        type=str,
+        required=True,
+        help="実行したいタスク内容",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    result = run_pipeline(task=args.task)
+    print(result)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+

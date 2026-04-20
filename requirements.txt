@@ -1,0 +1,4 @@
+crewai>=0.100,<1
+chromadb>=0.5,<1
+python-dotenv>=1,<2
+ollama>=0.4,<1
