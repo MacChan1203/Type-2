@@ -1,4 +1,4 @@
-crewai>=0.100,<1
-chromadb>=0.5,<1
-python-dotenv>=1,<2
-ollama>=0.4,<1
+crewai~=1.14.1
+chromadb~=1.1.1
+python-dotenv~=1.1.1
+ollama~=0.6.1

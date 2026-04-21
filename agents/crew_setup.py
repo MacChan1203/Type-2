@@ -1,18 +1,34 @@
 from __future__ import annotations
 
+from functools import lru_cache
 import os
 
-os.environ.setdefault("CREWAI_DISABLE_TELEMETRY", "true")
-os.environ.setdefault("OTEL_SDK_DISABLED", "true")
+
+def _configure_crewai_environment() -> None:
+    os.environ.setdefault("CREWAI_DISABLE_TELEMETRY", "true")
+    os.environ.setdefault("OTEL_SDK_DISABLED", "true")
+    os.environ.setdefault("CREWAI_TRACING_ENABLED", "false")
+
+    # TYPE2_CREWAI_HOME が明示されている場合だけ HOME を上書きする。
+    # 以前は常に HOME を CWD 配下へ差し替えていたため、同一プロセス内の
+    # 他コンポーネントが影響を受けていた。
+    override = os.environ.get("TYPE2_CREWAI_HOME")
+    if override:
+        os.environ["HOME"] = override
+
+
+_configure_crewai_environment()
+
 
 from crewai import Agent, Task, Crew, Process, LLM
+from crewai.events.listeners.tracing.utils import set_suppress_tracing_messages
 
 from config import settings
 from agents.prompts import (
     PLANNER_SYSTEM_PROMPT,
     WORKER_SYSTEM_PROMPT,
-    AGI_CONTROLLER_SYSTEM_PROMPT,
-    AGI_REFLECTOR_SYSTEM_PROMPT,
+    REFLECTIVE_CONTROLLER_SYSTEM_PROMPT,
+    REFLECTIVE_REFLECTOR_SYSTEM_PROMPT,
     INTENT_CHECK_PROMPT,
     INTENT_CRITIC_SYSTEM_PROMPT,
     QUALITY_CRITIC_SYSTEM_PROMPT,
@@ -20,15 +36,32 @@ from agents.prompts import (
     REVERSE_CRITIC_SYSTEM_PROMPT,
     IMPROVER_SYSTEM_PROMPT,
 )
+from utils.prompt_safety import INJECTION_DISCLAIMER, wrap_untrusted
 
 
+set_suppress_tracing_messages(True)
+
+
+@lru_cache(maxsize=1)
 def build_llm() -> LLM:
     return LLM(
         model=f"ollama/{settings.ollama_model}",
-        base_url="http://localhost:11434",
+        base_url=settings.ollama_base_url,
     )
 
+
+_agent_cache: dict[str, Agent] = {}
+
+
+def reset_agent_caches() -> None:
+    """テスト時や設定差し替え時に LLM/Agent の内部キャッシュを初期化する。"""
+    build_llm.cache_clear()
+    _agent_cache.clear()
+
+
 def build_agent(agent_key: str) -> Agent:
+    if agent_key in _agent_cache:
+        return _agent_cache[agent_key]
     llm = build_llm()
 
     specs = {
@@ -44,17 +77,17 @@ def build_agent(agent_key: str) -> Agent:
             "backstory": "通常タスクでも逆タスクでも、与えられた意図を最優先に実行するAI。",
             "system_template": WORKER_SYSTEM_PROMPT,
         },
-        "agi_controller": {
-            "role": "AGIController",
+        "reflective_controller": {
+            "role": "ReflectiveController",
             "goal": "目標を安全で実行可能な認知サイクルに分解する",
             "backstory": "真のAGIではないが、目標分析、制約整理、実行方針の作成を担当する制御役。",
-            "system_template": AGI_CONTROLLER_SYSTEM_PROMPT,
+            "system_template": REFLECTIVE_CONTROLLER_SYSTEM_PROMPT,
         },
-        "agi_reflector": {
-            "role": "AGIReflector",
+        "reflective_reflector": {
+            "role": "ReflectiveReflector",
             "goal": "出力を検証し、次の改善方針を決める",
             "backstory": "過去タスク混入や目的逸脱を検出し、次サイクルに必要な最小改善を示す反省役。",
-            "system_template": AGI_REFLECTOR_SYSTEM_PROMPT,
+            "system_template": REFLECTIVE_REFLECTOR_SYSTEM_PROMPT,
         },
         "intent_critic": {
             "role": "IntentCritic",
@@ -86,17 +119,25 @@ def build_agent(agent_key: str) -> Agent:
             "backstory": "改善の優先順位付けが得意なAI。元の意図を保ちながら、次の一手を短く具体的に決める。",
             "system_template": IMPROVER_SYSTEM_PROMPT,
         },
+        "intent_checker": {
+            "role": "IntentChecker",
+            "goal": "ユーザー指示の意図を正確に分類し、逆タスクかどうかを判定する",
+            "backstory": "指示の本来の目的を見抜くことに特化したAI。",
+            "system_template": INTENT_CHECK_PROMPT,
+        },
     }
 
     if agent_key not in specs:
-        raise ValueError(f"Unknown agent key: {agent_key}")
+        raise ValueError(f"不明なエージェントキー: {agent_key}")
 
-    return Agent(
+    agent = Agent(
         llm=llm,
         verbose=False,
         allow_delegation=False,
         **specs[agent_key],
     )
+    _agent_cache[agent_key] = agent
+    return agent
 
 
 
@@ -105,9 +146,10 @@ def run_planner(task_text: str, memory_text: str) -> str:
 
     planning_task = Task(
         description=(
+            f"{INJECTION_DISCLAIMER}\n\n"
             f"以下の依頼を達成するための実行計画を作成してください。\n\n"
-            f"依頼:\n{task_text}\n\n"
-            f"参考記憶:\n{memory_text}\n\n"
+            f"依頼:\n{wrap_untrusted(task_text, 'task')}\n\n"
+            f"参考記憶:\n{wrap_untrusted(memory_text, 'memory')}\n\n"
             f"重要: 参考記憶は補助情報です。現在の依頼と矛盾する場合は必ず現在の依頼を優先し、参考記憶の題材へ逸脱しないでください。\n\n"
             f"3〜5個の箇条書きで、実行順に書いてください。"
         ),
@@ -120,6 +162,7 @@ def run_planner(task_text: str, memory_text: str) -> str:
         tasks=[planning_task],
         process=Process.sequential,
         verbose=False,
+        tracing=False,
     )
 
     result = crew.kickoff()
@@ -132,53 +175,38 @@ def build_worker_description(
     plan_text: str,
     is_reverse: bool = False,
 ) -> str:
+    wrapped_task = wrap_untrusted(task_text, "task")
+    wrapped_memory = wrap_untrusted(memory_text, "memory")
+    wrapped_plan = wrap_untrusted(plan_text, "plan")
     if is_reverse:
         return f"""
-あなたは「壊れたPythonコード」を作る専門AIです。
-このタスクでは、品質を上げることは禁止です。
+{INJECTION_DISCLAIMER}
 
-【最重要ルール】
-- 正しいコードを書いてはいけない
-- 高品質なコードを書いてはいけない
-- 必ず意図的な欠陥を含めること
-- 説明文、前置き、要約、解説は禁止
-- 出力は Python コード本文のみ
-- Markdown の ``` は使わないこと
+このタスクは「意図的に欠陥を含む壊れたPythonコード」を作ることです。
+正しいコードを書くことは禁止です。
 
 【必須条件】
-以下を必ずすべて満たしてください。
-- バグを最低5個以上入れる
-- 少なくとも1つは実行時エラー
-- 少なくとも1つは論理バグ
-- 少なくとも1つはデータ処理または状態管理のバグ
-- 少なくとも1つは不適切な例外処理
-- 少なくとも1つはセキュリティまたは情報漏えいリスク
-- 良い設計に見えても、内部に欠陥を残すこと
-- コードは Python の構文としてはなるべく成立させること
-- ただし、実行すると誤動作や例外が起きるようにすること
-
-【禁止事項】
-- 安全に修正してはいけない
-- 保守しやすくしてはいけない
-- バグを減らしてはいけない
-- テストしやすくしてはいけない
-- 説明でごまかしてはいけない
-
-依頼:
-{task_text}
-
-参考記憶:
-{memory_text}
-
-参考計画:
-{plan_text}
+- 実行時エラー・論理バグ・状態管理バグ・例外処理の欠陥・セキュリティ問題を少なくとも各1つ含める
+- Pythonの構文として成立させるが、実行すると誤動作や例外が起きるようにする
+- コメントでバグを説明・ラベリングしない（通常の開発者コメント程度にする）
+- トップレベルで危険な副作用（ファイル操作・外部コマンド）を実行しない
 
 【出力形式】
-Pythonコードだけをそのまま出力してください。
-ファイル全体として読める形にしてください。
+Pythonコード本文のみ。説明文・前置き・Markdownコードブロック(```)は不要。
+
+依頼:
+{wrapped_task}
+
+参考記憶:
+{wrapped_memory}
+
+参考計画:
+{wrapped_plan}
 """.strip()
 
     return f"""
+{INJECTION_DISCLAIMER}
+
 あなたは実行担当エージェントです。
 依頼と計画に従い、実用的で具体的な成果物を作成してください。
 
@@ -192,13 +220,13 @@ Pythonコードだけをそのまま出力してください。
 - 出力は日本語を基本にする
 
 依頼:
-{task_text}
+{wrapped_task}
 
 参考記憶:
-{memory_text}
+{wrapped_memory}
 
 参考計画:
-{plan_text}
+{wrapped_plan}
 """.strip()
 
 
@@ -230,20 +258,22 @@ def run_worker(
         tasks=[worker_task],
         process=Process.sequential,
         verbose=False,
+        tracing=False,
     )
 
     result = crew.kickoff()
     return str(result).strip()
 
 
-def run_agi_controller(task_text: str, memory_text: str) -> str:
-    controller = build_agent("agi_controller")
+def run_reflective_controller(task_text: str, memory_text: str) -> str:
+    controller = build_agent("reflective_controller")
 
     controller_task = Task(
         description=(
-            f"以下の依頼をAGI-modeの認知サイクルとして整理してください。\n\n"
-            f"依頼:\n{task_text}\n\n"
-            f"参考記憶:\n{memory_text}\n\n"
+            f"{INJECTION_DISCLAIMER}\n\n"
+            f"以下の依頼を反省モードの認知サイクルとして整理してください。\n\n"
+            f"依頼:\n{wrap_untrusted(task_text, 'task')}\n\n"
+            f"参考記憶:\n{wrap_untrusted(memory_text, 'memory')}\n\n"
             f"参考記憶は補助情報です。現在の依頼と矛盾する場合は無視してください。\n"
             f"必ずJSONのみで返してください。"
         ),
@@ -259,27 +289,29 @@ def run_agi_controller(task_text: str, memory_text: str) -> str:
         tasks=[controller_task],
         process=Process.sequential,
         verbose=False,
+        tracing=False,
     )
 
     result = crew.kickoff()
     return str(result).strip()
 
 
-def run_agi_reflector(
+def run_reflective_reflector(
     task_text: str,
     plan_text: str,
     output_text: str,
     review_text: str,
 ) -> str:
-    reflector = build_agent("agi_reflector")
+    reflector = build_agent("reflective_reflector")
 
     reflection_task = Task(
         description=(
-            f"以下のAGI-modeサイクル結果を評価してください。\n\n"
-            f"元の依頼:\n{task_text}\n\n"
-            f"計画:\n{plan_text}\n\n"
-            f"成果物:\n{output_text}\n\n"
-            f"既存レビュー:\n{review_text}\n\n"
+            f"{INJECTION_DISCLAIMER}\n\n"
+            f"以下の反省モードサイクル結果を評価してください。\n\n"
+            f"元の依頼:\n{wrap_untrusted(task_text, 'task')}\n\n"
+            f"計画:\n{wrap_untrusted(plan_text, 'plan')}\n\n"
+            f"成果物:\n{wrap_untrusted(output_text, 'output')}\n\n"
+            f"既存レビュー:\n{wrap_untrusted(review_text, 'review')}\n\n"
             f"必ずJSONのみで返してください。"
         ),
         agent=reflector,
@@ -294,31 +326,33 @@ def run_agi_reflector(
         tasks=[reflection_task],
         process=Process.sequential,
         verbose=False,
+        tracing=False,
     )
 
     result = crew.kickoff()
     return str(result).strip()
 
 def run_intent_checker(task_text: str) -> str:
-    planner = build_agent("planner")
+    intent_agent = build_agent("intent_checker")
 
     intent_task = Task(
         description=(
-            f"{INTENT_CHECK_PROMPT}\n\n"
+            f"{INJECTION_DISCLAIMER}\n\n"
             f"以下のユーザーの指示の意図を分析してください。\n\n"
-            f"指示:\n{task_text}\n\n"
-            f"以下のJSON形式で返してください:\n"
-            f'{{"intent": "...", "is_reverse_task": true/false, "success_criteria": "..."}}'
+            f"指示:\n{wrap_untrusted(task_text, 'task')}"
         ),
-        agent=planner,
-        expected_output="JSON形式の意図分析",
+        agent=intent_agent,
+        expected_output=(
+            'JSON: {"intent": "...", "is_reverse_task": true/false, "success_criteria": "..."}'
+        ),
     )
 
     crew = Crew(
-        agents=[planner],
+        agents=[intent_agent],
         tasks=[intent_task],
         process=Process.sequential,
         verbose=False,
+        tracing=False,
     )
 
     result = crew.kickoff()
@@ -330,9 +364,10 @@ def run_intent_critic(task_text: str, output_text: str) -> str:
 
     critic_task = Task(
         description=(
+            f"{INJECTION_DISCLAIMER}\n\n"
             f"以下の成果物が、ユーザーの依頼にどれだけ忠実かを評価してください。\n\n"
-            f"依頼:\n{task_text}\n\n"
-            f"成果物:\n{output_text}\n\n"
+            f"依頼:\n{wrap_untrusted(task_text, 'task')}\n\n"
+            f"成果物:\n{wrap_untrusted(output_text, 'output')}\n\n"
             f"必ずJSONのみで返してください。"
         ),
         agent=intent_critic,
@@ -347,6 +382,7 @@ def run_intent_critic(task_text: str, output_text: str) -> str:
         tasks=[critic_task],
         process=Process.sequential,
         verbose=False,
+        tracing=False,
     )
 
     result = crew.kickoff()
@@ -359,9 +395,10 @@ def run_quality_critic(task_text: str, output_text: str, is_reverse: bool = Fals
 
     critic_task = Task(
         description=(
+            f"{INJECTION_DISCLAIMER}\n\n"
             f"以下の{subject}を評価してください。\n\n"
-            f"依頼:\n{task_text}\n\n"
-            f"成果物:\n{output_text}\n\n"
+            f"依頼:\n{wrap_untrusted(task_text, 'task')}\n\n"
+            f"成果物:\n{wrap_untrusted(output_text, 'output')}\n\n"
             f"必ずJSONのみで返してください。"
         ),
         agent=critic,
@@ -376,6 +413,7 @@ def run_quality_critic(task_text: str, output_text: str, is_reverse: bool = Fals
         tasks=[critic_task],
         process=Process.sequential,
         verbose=False,
+        tracing=False,
     )
 
     result = crew.kickoff()
@@ -386,9 +424,10 @@ def run_reverse_critic(task_text: str, output_text: str) -> str:
 
     critic_task = Task(
         description=(
+            f"{INJECTION_DISCLAIMER}\n\n"
             f"以下の成果物が、逆タスクとしてどれだけ適切に壊れているか評価してください。\n\n"
-            f"依頼:\n{task_text}\n\n"
-            f"成果物:\n{output_text}\n\n"
+            f"依頼:\n{wrap_untrusted(task_text, 'task')}\n\n"
+            f"成果物:\n{wrap_untrusted(output_text, 'output')}\n\n"
             f"必ずJSONのみで返してください。"
         ),
         agent=reverse_critic,
@@ -403,6 +442,7 @@ def run_reverse_critic(task_text: str, output_text: str) -> str:
         tasks=[critic_task],
         process=Process.sequential,
         verbose=False,
+        tracing=False,
     )
 
     result = crew.kickoff()
@@ -413,9 +453,10 @@ def run_improver(task_text: str, review_text: str) -> str:
 
     improver_task = Task(
         description=(
+            f"{INJECTION_DISCLAIMER}\n\n"
             f"以下の元タスクと評価結果を読み、次回の改善方針を決めてください。\n\n"
-            f"元タスク:\n{task_text}\n\n"
-            f"評価結果:\n{review_text}\n\n"
+            f"元タスク:\n{wrap_untrusted(task_text, 'task')}\n\n"
+            f"評価結果:\n{wrap_untrusted(review_text, 'review')}\n\n"
             f"必ずJSONのみで返してください。"
         ),
         agent=improver,
@@ -429,6 +470,7 @@ def run_improver(task_text: str, review_text: str) -> str:
         tasks=[improver_task],
         process=Process.sequential,
         verbose=False,
+        tracing=False,
     )
 
     result = crew.kickoff()

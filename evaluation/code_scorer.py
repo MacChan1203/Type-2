@@ -1,38 +1,50 @@
 from __future__ import annotations
 
+import ast
+import re
 
-CODE_HINTS = (
-    "def ",
-    "class ",
-    "import ",
-    "from ",
-    "```",
-    "return ",
-    "if __name__",
-    "function ",
-    "const ",
-    "let ",
-    "var ",
-    "SELECT ",
-    "<html",
-    "#!/bin/",
+
+# 行頭または空白直後に現れるキーワードだけをコード兆候として認める。
+# これにより "1 from 10" のような自然文が誤ってコード判定されない。
+CODE_HINT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?:^|\n)\s*def\s"),
+    re.compile(r"(?:^|\n)\s*class\s"),
+    re.compile(r"(?:^|\n)\s*import\s"),
+    re.compile(r"(?:^|\n)\s*from\s+\S+\s+import\s"),
+    re.compile(r"```"),
+    re.compile(r"\breturn\s+\S"),
+    re.compile(r"\bif\s+__name__\b"),
+    re.compile(r"(?:^|\n)\s*function\s"),
+    re.compile(r"(?:^|\n)\s*const\s+\w+"),
+    re.compile(r"(?:^|\n)\s*let\s+\w+"),
+    re.compile(r"(?:^|\n)\s*var\s+\w+"),
+    re.compile(r"\bSELECT\s+\w", re.IGNORECASE),
+    re.compile(r"<html\b", re.IGNORECASE),
+    re.compile(r"^#!/bin/", re.MULTILINE),
 )
 
 
 def looks_like_code(text: str) -> bool:
-    lowered = text.lower()
-    return any(hint.lower() in lowered for hint in CODE_HINTS)
+    return any(pattern.search(text) for pattern in CODE_HINT_PATTERNS)
+
+
+def looks_like_plain_python(text: str) -> bool:
+    stripped = text.lstrip()
+    if stripped.startswith("```"):
+        return False
+    return stripped.startswith(("def ", "class ", "import ", "from "))
 
 
 def score_text(output: str) -> int:
     text = output.strip()
+    lower = text.lower()
     score = 100
 
     if len(text) < 25:
         score -= 35
     if len(text.split()) < 8 and len(text) < 45:
         score -= 20
-    if "todo" in text.lower() or "fixme" in text.lower():
+    if re.search(r"\btodo\b", lower) or re.search(r"\bfixme\b", lower):
         score -= 10
     if text.count("\n") == 0 and len(text) > 800:
         score -= 15
@@ -53,7 +65,7 @@ def score_code(output: str, is_reverse: bool = False) -> int:
     if is_reverse:
         if not looks_like_code(output):
             return 0
-        if "def " not in code_lower and "class " not in code_lower:
+        if not re.search(r"\bdef\s", code_lower) and not re.search(r"\bclass\s", code_lower):
             score -= 20
         if "```" in code_lower:
             score -= 10
@@ -64,28 +76,36 @@ def score_code(output: str, is_reverse: bool = False) -> int:
     if not looks_like_code(output):
         return score_text(output)
 
-    if "eval(" in code_lower:
+    # 実用度ヒット: 関数/メソッド呼び出しに限定し、識別子の部分一致を除外
+    if re.search(r"\beval\s*\(", output):
         score -= 40
 
-    if "exec(" in code_lower:
+    if re.search(r"\bexec\s*\(", output):
         score -= 40
 
-    if "except exception" in code_lower:
+    if looks_like_plain_python(output):
+        try:
+            ast.parse(output)
+        except SyntaxError:
+            score -= 35
+
+    if re.search(r"\bexcept\s+Exception\b", output):
         score -= 20
 
-    if "pass" in code_lower:
+    # "pass" 文単独の行のみ検出（password 等の部分一致を防ぐ）
+    if re.search(r"(?:^|\n)\s*pass\s*(?:#.*)?$", output, re.MULTILINE):
         score -= 10
 
-    if "def " not in code_lower and "class " not in code_lower:
+    if not re.search(r"\bdef\s", code_lower) and not re.search(r"\bclass\s", code_lower):
         score -= 20
 
-    if "todo" in code_lower:
+    if re.search(r"\btodo\b", code_lower):
         score -= 5
 
-    if "fixme" in code_lower:
+    if re.search(r"\bfixme\b", code_lower):
         score -= 10
 
-    if "asdf" in code_lower or "xxx" in code_lower:
+    if re.search(r"\basdf\b", code_lower) or re.search(r"\bxxx\b", code_lower):
         score -= 10
 
     if len(output.strip()) < 20:

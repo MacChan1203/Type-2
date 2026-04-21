@@ -24,6 +24,8 @@ EXECUTION_TASK_MARKERS = (
     "になったら",
 )
 
+# 「取得に成功」「実行に成功」のようにフェッチ完了を宣言する語のみをマッチさせる。
+# 裸の「成功」はテスト成否などの一般文脈を誤検出するため含めない。
 EXECUTION_CLAIM_MARKERS = (
     "取得しました",
     "取得し",
@@ -33,7 +35,8 @@ EXECUTION_CLAIM_MARKERS = (
     "フェッチ",
     "クロール",
     "スクレイピング",
-    "成功",
+    "取得に成功",
+    "実行に成功",
     "完了しました",
     "翻訳しました",
 )
@@ -59,8 +62,17 @@ def claims_execution(output: str) -> bool:
 
 
 def has_execution_evidence(output: str) -> bool:
-    if "ステータス: FAILURE" in output or '"status": "FAILURE"' in output:
+    if (
+        "ステータス: 失敗" in output
+        or "ステータス: FAILURE" in output
+        or '"status": "FAILURE"' in output
+        or '"status": "失敗"' in output
+    ):
         return True
+
+    has_execution_time = bool(
+        re.search(r"実行時刻:\s*\d{4}-\d{2}-\d{2}T\d{2}:\d{2}", output)
+    )
 
     urls = re.findall(r"https?://[^\s)）>\"]+", output)
     real_urls = [
@@ -70,17 +82,15 @@ def has_execution_evidence(output: str) -> bool:
         and "xxxxxxxx" not in url
         and "ABC123" not in url
     ]
-    if real_urls:
-        return True
 
-    evidence_patterns = (
+    id_patterns = (
         r"\bitem\?id=\d+\b",
         r"\bid[=:]\s*\d+\b",
-        r"実行時刻:\s*\d{4}-\d{2}-\d{2}T\d{2}:\d{2}",
-        r"理由:\s*\S+",
-        r"取得メモ:\s*\S+",
     )
-    return any(re.search(pattern, output) for pattern in evidence_patterns)
+    has_retrieval_id = any(re.search(pattern, output) for pattern in id_patterns)
+    has_retrieval_note = bool(re.search(r"取得メモ:\s*\S+", output))
+
+    return has_execution_time and (bool(real_urls) or has_retrieval_id or has_retrieval_note)
 
 
 def detect_unsupported_execution_claim(task: str, output: str) -> bool:

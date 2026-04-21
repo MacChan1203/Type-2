@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from html.parser import HTMLParser
 import json
 import re
@@ -10,7 +10,9 @@ from urllib.error import URLError
 from urllib.request import Request, urlopen
 
 from config import settings
-from evaluation.scorer import extract_json_block
+from utils.json_utils import extract_json_block
+from utils.prompt_safety import INJECTION_DISCLAIMER, wrap_untrusted
+from utils.safe_http import safe_fetch_json, safe_fetch_text
 
 
 HN_TOP_STORIES_URL = "https://hacker-news.firebaseio.com/v0/topstories.json"
@@ -36,26 +38,13 @@ class VisibleTextParser(HTMLParser):
         if self._skip_depth:
             return
         text = re.sub(r"\s+", " ", data).strip()
-        if len(text) >= 30:
+        # 短い見出しや1行の抜粋も落とさない。total量は max_chars で制限する。
+        if text:
             self.parts.append(text)
 
     def get_text(self, max_chars: int = 5000) -> str:
         text = "\n".join(self.parts)
         return text[:max_chars].strip()
-
-
-def fetch_json_url(url: str, timeout: int = 20) -> Any:
-    req = Request(url, headers={"User-Agent": "Type-2/1.0"})
-    with urlopen(req, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8"))
-
-
-def fetch_text_url(url: str, timeout: int = 20, max_bytes: int = 1_000_000) -> str:
-    req = Request(url, headers={"User-Agent": "Type-2/1.0"})
-    with urlopen(req, timeout=timeout) as response:
-        raw = response.read(max_bytes)
-        encoding = response.headers.get_content_charset() or "utf-8"
-    return raw.decode(encoding, errors="replace")
 
 
 def html_to_visible_text(html: str, max_chars: int = 5000) -> str:
@@ -79,7 +68,12 @@ def is_hacker_news_task(task: str) -> bool:
 
 def parse_target_time(task: str, now: datetime | None = None) -> datetime | None:
     now = now or datetime.now()
-    jp_match = re.search(r"(午前|午後)?\s*(\d{1,2})\s*時\s*(\d{1,2})?\s*分?", task)
+    # 「時」は時刻を指す場合のみ拾う: 「時間/時前/時後/時半/時以降/時以内」等の単位用途は除外
+    jp_match = re.search(
+        r"(午前|午後)?\s*(\d{1,2})\s*時(?!間|前|後|半|以降|以内|程度|くらい|ほど)"
+        r"(?:\s*(\d{1,2})\s*分)?",
+        task,
+    )
     colon_match = re.search(r"\b(\d{1,2}):(\d{2})\b", task)
 
     if jp_match:
@@ -99,13 +93,17 @@ def parse_target_time(task: str, now: datetime | None = None) -> datetime | None
     if not 0 <= hour <= 23 or not 0 <= minute <= 59:
         return None
 
-    return now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return target
 
 
 def wait_until_target_time(
     target_time: datetime | None,
     verbose: bool = True,
     sleep_fn=time.sleep,
+    max_wait_seconds: int | None = None,
 ) -> str:
     if target_time is None:
         return ""
@@ -115,6 +113,13 @@ def wait_until_target_time(
         return "指定時刻はすでに過ぎていたため、即時実行しました。"
 
     seconds = (target_time - now).total_seconds()
+    wait_limit = settings.max_tool_wait_seconds if max_wait_seconds is None else max_wait_seconds
+    if seconds > wait_limit:
+        raise TimeoutError(
+            f"指定時刻までの待機が長すぎます: {int(seconds)}秒後 "
+            f"(上限: {wait_limit}秒)"
+        )
+
     if verbose:
         print(f"指定時刻 {target_time.strftime('%H:%M')} まで待機します。")
 
@@ -123,18 +128,18 @@ def wait_until_target_time(
 
 
 def fetch_hacker_news_top_story() -> dict[str, Any]:
-    story_ids = fetch_json_url(HN_TOP_STORIES_URL)
+    story_ids = safe_fetch_json(HN_TOP_STORIES_URL)
     if not isinstance(story_ids, list) or not story_ids:
-        raise RuntimeError("Hacker News API returned no top stories")
+        raise RuntimeError("Hacker News APIがトップ記事を返しませんでした")
 
     item_id = story_ids[0]
-    item = fetch_json_url(HN_ITEM_URL.format(item_id=item_id))
+    item = safe_fetch_json(HN_ITEM_URL.format(item_id=item_id))
     if not isinstance(item, dict):
-        raise RuntimeError(f"Hacker News item {item_id} is not an object")
+        raise RuntimeError(f"Hacker Newsの記事 {item_id} がオブジェクトではありません")
 
     title = str(item.get("title") or "").strip()
     if not title:
-        raise RuntimeError(f"Hacker News item {item_id} has no title")
+        raise RuntimeError(f"Hacker Newsの記事 {item_id} にタイトルがありません")
 
     item_url = HN_ITEM_PAGE_URL.format(item_id=item_id)
     article_url = str(item.get("url") or item_url).strip()
@@ -146,9 +151,11 @@ def fetch_hacker_news_top_story() -> dict[str, Any]:
         body_text = re.sub(r"\s+", " ", body_text).strip()
     elif article_url:
         try:
-            body_text = html_to_visible_text(fetch_text_url(article_url))
+            body_text = html_to_visible_text(safe_fetch_text(article_url))
         except (OSError, TimeoutError, URLError, UnicodeError) as e:
             body_error = f"記事本文の取得に失敗しました: {e}"
+        except ValueError as e:
+            body_error = str(e)
 
     return {
         "id": item_id,
@@ -169,7 +176,7 @@ def ollama_generate(prompt: str, timeout: int = 120) -> str:
         }
     ).encode("utf-8")
     req = Request(
-        "http://localhost:11434/api/generate",
+        f"{settings.ollama_base_url}/api/generate",
         data=payload,
         headers={"Content-Type": "application/json"},
         method="POST",
@@ -183,6 +190,8 @@ def translate_hn_story_to_japanese(story: dict[str, Any]) -> dict[str, str]:
     body = str(story.get("body") or "").strip()
     body_for_prompt = body[:3500] if body else "本文を取得できませんでした。タイトルのみ翻訳してください。"
     prompt = f"""
+{INJECTION_DISCLAIMER}
+
 以下はHacker Newsのトップ記事です。日本語にしてください。
 本文が長い場合は、本文全体の内容が伝わるように自然な日本語で要約してください。
 
@@ -190,10 +199,10 @@ def translate_hn_story_to_japanese(story: dict[str, Any]) -> dict[str, str]:
 {{"title_jp":"...", "body_jp":"..."}}
 
 原文タイトル:
-{story.get("title", "")}
+{wrap_untrusted(str(story.get("title", "")), 'hn_title')}
 
 原文本文:
-{body_for_prompt}
+{wrap_untrusted(body_for_prompt, 'hn_body')}
 """.strip()
 
     raw = ollama_generate(prompt)
@@ -248,13 +257,27 @@ HN:
 
 def run_hacker_news_task(task: str, verbose: bool = True) -> str:
     target_time = parse_target_time(task)
-    schedule_note = wait_until_target_time(target_time, verbose=verbose)
+    try:
+        schedule_note = wait_until_target_time(target_time, verbose=verbose)
+    except TimeoutError as e:
+        return f"""
+【Hacker News トップニュース】
+ステータス: 失敗
+実行時刻: {datetime.now().isoformat(timespec="seconds")}
+
+本文:
+指定時刻までの待機が長すぎるため、Hacker Newsの取得を開始しませんでした。
+
+理由:
+{e}
+""".strip()
+
     try:
         story = fetch_hacker_news_top_story()
     except Exception as e:
         return f"""
 【Hacker News トップニュース】
-ステータス: FAILURE
+ステータス: 失敗
 実行時刻: {datetime.now().isoformat(timespec="seconds")}
 {schedule_note}
 

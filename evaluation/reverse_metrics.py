@@ -9,7 +9,6 @@ DEFECT_PATTERNS = {
     "runtime_bug": [
         r"\braise\s+",
         r"\b1\s*/\s*0\b",
-        r"\[[^\]]+\]\s*\[[^\]]+\]",
         r"\bNone\.",
     ],
     "logic_bug": [
@@ -27,11 +26,13 @@ DEFECT_PATTERNS = {
         r"\bdatetime\.now\(",
     ],
     "data_bug": [
-        r"\.split\(['\"][,;]['\"]\)",
-        r"\bint\(",
-        r"\bfloat\(",
-        r"\.strip\(\)",
-        r"\.lower\(\)",
+        # split してそのまま固定インデックスを取るのは典型的なデータバグ
+        r"\.split\(['\"][,;]['\"]\)\s*\[",
+        # 多段インデックス参照（誤った shape 仮定）
+        r"\[[^\]]+\]\s*\[[^\]]+\]",
+        # 辞書取得値を bool 不定のまま int 変換するパターン
+        r"\bint\(\s*[A-Za-z_][A-Za-z0-9_]*\.get\(",
+        r"\bfloat\(\s*[A-Za-z_][A-Za-z0-9_]*\.get\(",
     ],
     "exception_bug": [
         r"except\s*:",
@@ -49,6 +50,56 @@ DEFECT_PATTERNS = {
         r"open\([^)]*['\"]w",
     ],
 }
+
+
+OVEREXPLAINED_COMMENT_MARKERS = (
+    "意図的なバグ",
+    "バグの埋め込み",
+    "欠陥",
+    "セキュリティリスク",
+    "情報漏えい",
+    "実行時エラー",
+    "論理バグ",
+    "状態管理",
+    "不適切な例外処理",
+)
+
+
+COMMENT_MISMATCH_PATTERNS = (
+    (
+        r"#.*appendではなく.*インデックス",
+        r"\.append\(",
+    ),
+    (
+        r"#.*0で割",
+        r"/\s*\([^)]*\+\s*1\)",
+    ),
+    (
+        r"#.*例外を投げる",
+        r"return\s+",
+    ),
+)
+
+
+def detect_overexplained_bug_comments(text: str) -> bool:
+    comment_lines = [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip().startswith("#")
+    ]
+    hits = 0
+    for line in comment_lines:
+        if any(marker in line for marker in OVEREXPLAINED_COMMENT_MARKERS):
+            hits += 1
+    return hits >= 2
+
+
+def detect_comment_code_mismatch(text: str) -> bool:
+    return any(
+        re.search(comment_pattern, text, re.IGNORECASE)
+        and re.search(code_pattern, text, re.IGNORECASE)
+        for comment_pattern, code_pattern in COMMENT_MISMATCH_PATTERNS
+    )
 
 
 def score_reverse_output(output_text: str) -> dict[str, Any]:
@@ -121,17 +172,35 @@ def score_reverse_output(output_text: str) -> dict[str, Any]:
         weaknesses.append("成果物が断片的")
         tags.append("weak_structure")
 
-    # 6. 良いコードすぎる兆候への減点
+    # 6. コメントが答え合わせになっていないか、実装と矛盾していないか
+    comment_penalty = 0
+    if detect_overexplained_bug_comments(text):
+        comment_penalty += 10
+        weaknesses.append("コメントでバグの場所や種類を説明しすぎている")
+        tags.append("overexplained_bug_comments")
+
+    if detect_comment_code_mismatch(text):
+        comment_penalty += 12
+        weaknesses.append("コメントと実装内容が矛盾している")
+        tags.append("comment_code_mismatch")
+
+    if comment_penalty == 0:
+        strengths.append("コメントが過剰な答え合わせになっていない")
+
+    # 7. 良いコードすぎる兆候への減点。
+    # 以前は "production-ready" 等の英単語部分一致で減点していたが、
+    # 逆タスクの説明文に付随して正当に現れうるため誤爆しやすい。
+    # ここでは「欠陥が一切検出できない」実体ベースの兆候のみ見る。
     anti_quality_penalty = 0
-    if "production-ready" in lower or "best practice" in lower or "robust" in lower:
-        anti_quality_penalty += 10
-    if "todo" not in lower and "pass" not in lower and not matched_categories:
+    if not matched_categories and not re.search(r"\btodo\b|\bfixme\b|\bpass\b", text, re.IGNORECASE):
         anti_quality_penalty += 15
 
     if anti_quality_penalty:
         score -= anti_quality_penalty
         weaknesses.append("逆タスクなのに良いコード方向へ寄りすぎている")
         tags.append("too_correct")
+
+    score -= comment_penalty
 
     score = max(0, min(100, score))
 
@@ -142,4 +211,3 @@ def score_reverse_output(output_text: str) -> dict[str, Any]:
         "tags": tags,
         "next_action": "逆タスクでは、説明を混ぜず、コード本文の中に複数種類の自然な欠陥を埋め込むこと。",
     }
-
